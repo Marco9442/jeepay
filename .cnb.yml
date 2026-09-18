@@ -1,0 +1,48 @@
+# 本文件属于 Fork overlay：GitHub 推送到 CNB 后，由 CNB 流水线构建并发布镜像。
+# 与 GitHub Actions 使用同一份源码，不比较镜像 digest。
+
+master:
+  push:
+    - name: 构建并发布镜像
+      services:
+        - docker
+      docker:
+        image: maven:3.9.9-eclipse-temurin-17
+      stages:
+        - name: 打包并推送镜像
+          script: |
+            set -eu
+            mvn -B -DskipTests -T 1C clean package
+            REG="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
+            TAG="${CNB_COMMIT_SHORT}"
+            for svc in jeepay-manager jeepay-merchant jeepay-payment; do
+              docker build \
+                -t "${REG}/${svc}:${TAG}" \
+                -t "${REG}/${svc}:latest" \
+                "$svc"
+              docker push "${REG}/${svc}:${TAG}"
+              docker push "${REG}/${svc}:latest"
+            done
+
+main:
+  push:
+    - name: 构建并发布镜像
+      services:
+        - docker
+      docker:
+        image: maven:3.9.9-eclipse-temurin-17
+      stages:
+        - name: 打包并推送镜像
+          script: |
+            set -eu
+            mvn -B -DskipTests -T 1C clean package
+            REG="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
+            TAG="${CNB_COMMIT_SHORT}"
+            for svc in jeepay-manager jeepay-merchant jeepay-payment; do
+              docker build \
+                -t "${REG}/${svc}:${TAG}" \
+                -t "${REG}/${svc}:latest" \
+                "$svc"
+              docker push "${REG}/${svc}:${TAG}"
+              docker push "${REG}/${svc}:latest"
+            done

@@ -1,0 +1,211 @@
+# 本文件属于 Fork overlay：上游同步后必须保留。
+# 职责：每小时对齐 jeequan/jeepay，有更新则发布 GHCR，并推代码到 CNB 触发其流水线。
+name: 同步上游并发布镜像
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+concurrency:
+  group: jeepay-mirror
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  UPSTREAM_REPO: jeequan/jeepay
+  OVERLAY_FILES: ".github/workflows/mirror-release.yml .cnb.yml"
+  SERVICES: "jeepay-manager jeepay-merchant jeepay-payment"
+
+jobs:
+  sync:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: master
+
+      - name: 同步上游 master
+        id: sync
+        env:
+          OVERLAY_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin master
+          git checkout -B master origin/master
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || true
+          git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream master
+
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "已包含上游最新提交，无需同步"
+            exit 0
+          fi
+
+          restore_overlay() {
+            # 用启动本次工作流的版本覆盖 overlay，避免被上游同名文件带走
+            # shellcheck disable=SC2086
+            git checkout "$OVERLAY_SHA" -- $OVERLAY_FILES
+            # shellcheck disable=SC2086
+            git add -- $OVERLAY_FILES
+          }
+
+          if git merge --no-edit upstream/master; then
+            restore_overlay
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: 保留镜像同步与发布配置"
+            fi
+          else
+            # 只自动解决 overlay 冲突；其余冲突失败，避免静默丢上游代码
+            restore_overlay
+            leftover="$(git ls-files -u | awk '{print $4}' | sort -u | grep -v -E '^(\.github/workflows/mirror-release\.yml|\.cnb\.yml)$' || true)"
+            if [ -n "$leftover" ]; then
+              echo "存在无法自动解决的合并冲突:" >&2
+              echo "$leftover" >&2
+              git status
+              exit 1
+            fi
+            git commit --no-edit
+          fi
+
+          git push origin HEAD:master
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: sync
+    if: |
+      always() &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       (needs.sync.result == 'success' && needs.sync.outputs.changed == 'true'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CNB_TOKEN: ${{ secrets.CNB_TOKEN }}
+      CNB_REPO: ${{ vars.CNB_REPO }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: 准备 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: 打包 JAR
+        run: mvn -B -DskipTests -T 1C clean package
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送 GHCR 镜像
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse --short HEAD)"
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          for svc in ${SERVICES}; do
+            img="ghcr.io/${owner}/${svc}"
+            docker build \
+              --build-arg BASE_IMAGE=eclipse-temurin:17-jre \
+              -t "${img}:latest" \
+              -t "${img}:sha-${SHA}" \
+              "$svc"
+            docker push "${img}:latest"
+            docker push "${img}:sha-${SHA}"
+          done
+
+      - name: 公开 GHCR 包
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          for svc in ${SERVICES}; do
+            gh api --method PUT \
+              "/user/packages/container/${svc}/visibility" \
+              -f visibility=public || true
+          done
+
+      - name: 推送到 CNB 并触发流水线
+        run: |
+          set -euo pipefail
+          if [ -z "${CNB_TOKEN}" ]; then
+            echo "缺少 GitHub Secret: CNB_TOKEN" >&2
+            exit 1
+          fi
+
+          api="https://api.cnb.cool"
+          auth_hdr() {
+            curl -sS "$@" \
+              -H "Authorization: Bearer ${CNB_TOKEN}" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json"
+          }
+
+          if [ -z "${CNB_REPO}" ]; then
+            username="$(auth_hdr "${api}/user" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("username",""))')"
+            if [ -z "$username" ]; then
+              echo "无法读取 CNB 用户名，请设置变量 CNB_REPO，例如 my-org/jeepay" >&2
+              exit 1
+            fi
+            group="$(auth_hdr "${api}/user/groups?page=1&page_size=50&role=Owner" | python3 -c 'import json,sys; data=json.load(sys.stdin); items=data if isinstance(data,list) else data.get("data") or data.get("items") or []; print((items[0].get("path") or items[0].get("name") or "") if items else "")')"
+            if [ -z "$group" ]; then
+              echo "未找到 Owner 组织，尝试创建 ${username}"
+              auth_hdr -X POST "${api}/groups" \
+                -d "{\"path\":\"${username}\",\"description\":\"personal\"}" >/tmp/cnb-group.json || true
+              group="$username"
+            fi
+            CNB_REPO="${group}/jeepay"
+            echo "使用 CNB 仓库 ${CNB_REPO}"
+          fi
+
+          group="${CNB_REPO%/*}"
+          name="${CNB_REPO##*/}"
+          code="$(curl -sS -o /tmp/cnb-repo.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${CNB_TOKEN}" \
+            -H "Accept: application/json" \
+            "${api}/${CNB_REPO}")"
+          if [ "$code" = "404" ]; then
+            echo "创建 CNB 仓库 ${CNB_REPO}"
+            auth_hdr -X POST "${api}/${group}/-/repos" \
+              -d "{\"name\":\"${name}\",\"visibility\":\"public\",\"description\":\"Jeepay public fork mirror from GitHub\"}"
+          elif [ "$code" != "200" ]; then
+            echo "查询 CNB 仓库失败 HTTP ${code}" >&2
+            cat /tmp/cnb-repo.json >&2 || true
+            exit 1
+          fi
+
+          # 凭证只用于本次 push；GitHub 会对 Secret 做日志脱敏
+          git push --force "https://cnb:${CNB_TOKEN}@cnb.cool/${CNB_REPO}" "HEAD:refs/heads/master"
+
+          # push 会触发 .cnb.yml；再补一次 API 触发，避免空仓库首推偶发未建
+          curl -sS -o /tmp/cnb-build.json -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${CNB_TOKEN}" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            "${api}/${CNB_REPO}/-/build/start" \
+            -d "{\"branch\":\"master\",\"title\":\"sync from github\"}" >/tmp/cnb-build.code
+          echo "CNB 构建触发 HTTP $(cat /tmp/cnb-build.code)"
