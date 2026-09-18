@@ -125,10 +125,14 @@ jobs:
           set -euo pipefail
           SHA="$(git rev-parse --short HEAD)"
           owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          src="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
           for svc in ${SERVICES}; do
             img="ghcr.io/${owner}/${svc}"
             docker build \
               --build-arg BASE_IMAGE=eclipse-temurin:17-jre \
+              --label "org.opencontainers.image.source=${src}" \
+              --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+              --label "org.opencontainers.image.title=${svc}" \
               -t "${img}:latest" \
               -t "${img}:sha-${SHA}" \
               "$svc"
@@ -142,9 +146,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER}"
           for svc in ${SERVICES}; do
             gh api --method PUT \
-              "/user/packages/container/${svc}/visibility" \
+              "/users/${owner}/packages/container/${svc}/visibility" \
               -f visibility=public || true
           done
 
