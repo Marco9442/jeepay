@@ -1,5 +1,5 @@
 # 本文件属于 Fork overlay：上游同步后必须保留。
-# 职责：每小时对齐 jeequan/jeepay，有更新则发布 GHCR，并推代码到 CNB 触发其流水线。
+# 职责：每小时对齐 jeequan/jeepay，有更新则按 isys.version 发固定版本镜像，并推代码到 CNB。
 name: 同步上游并发布镜像
 
 on:
@@ -102,10 +102,50 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: master
-          # CNB 拒绝浅克隆推送（shallow update not allowed）
           fetch-depth: 0
 
+      - name: 解析版本
+        id: ver
+        run: |
+          set -euo pipefail
+          raw="$(sed -n 's/.*<isys.version>\([^<]*\)<\/isys.version>.*/\1/p' pom.xml | head -1 | tr -d '[:space:]')"
+          if ! echo "$raw" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "pom.xml isys.version 必须是 x.y.z，当前是: ${raw}" >&2
+            exit 1
+          fi
+          echo "version=v${raw}" >> "$GITHUB_OUTPUT"
+          echo "使用版本 v${raw}"
+
+      - name: 检查版本是否已发布
+        id: published
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          python3 - "$owner" "$VERSION" $SERVICES <<'PY'
+          import json, os, sys, urllib.request, urllib.error
+          owner, version, *svcs = sys.argv[1:]
+          missing = []
+          for svc in svcs:
+              tok_url = f"https://ghcr.io/token?service=ghcr.io&scope=repository:{owner}/{svc}:pull"
+              with urllib.request.urlopen(tok_url, timeout=20) as r:
+                  token = json.load(r).get("token") or ""
+              req = urllib.request.Request(f"https://ghcr.io/v2/{owner}/{svc}/manifests/{version}")
+              req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json")
+              try:
+                  urllib.request.urlopen(req, timeout=20)
+              except urllib.error.HTTPError:
+                  missing.append(svc)
+          skip = "false" if missing else "true"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"skip={skip}\n")
+          print("skip", skip, "missing", ",".join(missing) or "-")
+          PY
+
       - name: 准备 JDK 17
+        if: steps.published.outputs.skip != 'true'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -113,9 +153,11 @@ jobs:
           cache: maven
 
       - name: 打包 JAR
+        if: steps.published.outputs.skip != 'true'
         run: mvn -B -DskipTests -T 1C clean package
 
       - name: 登录 GHCR
+        if: steps.published.outputs.skip != 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -123,9 +165,11 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 构建并推送 GHCR 镜像
+        if: steps.published.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          SHA="$(git rev-parse --short HEAD)"
           owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           src="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
           for svc in ${SERVICES}; do
@@ -134,15 +178,15 @@ jobs:
               --build-arg BASE_IMAGE=eclipse-temurin:17-jre \
               --label "org.opencontainers.image.source=${src}" \
               --label "org.opencontainers.image.revision=$(git rev-parse HEAD)" \
+              --label "org.opencontainers.image.version=${VERSION}" \
               --label "org.opencontainers.image.title=${svc}" \
-              -t "${img}:latest" \
-              -t "${img}:sha-${SHA}" \
+              -t "${img}:${VERSION}" \
               "$svc"
-            docker push "${img}:latest"
-            docker push "${img}:sha-${SHA}"
+            docker push "${img}:${VERSION}"
           done
 
       - name: 公开 GHCR 包
+        if: steps.published.outputs.skip != 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -156,6 +200,9 @@ jobs:
           done
 
       - name: 推送到 CNB 并触发流水线
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          SKIP_IMAGE: ${{ steps.published.outputs.skip }}
         run: |
           set -euo pipefail
           if [ -z "${CNB_TOKEN}" ]; then
@@ -204,15 +251,21 @@ jobs:
             exit 1
           fi
 
-          # 凭证只用于本次 push；GitHub 会对 Secret 做日志脱敏
           git push --force "https://cnb:${CNB_TOKEN}@cnb.cool/${CNB_REPO}" "HEAD:refs/heads/master"
 
-          # push 会触发 .cnb.yml；再补一次 API 触发，避免空仓库首推偶发未建
+          if [ "${SKIP_IMAGE}" = "true" ]; then
+            echo "版本 ${VERSION} 已发布，只同步代码，不触发 CNB 构建。"
+            exit 0
+          fi
+
           curl -sS -o /tmp/cnb-build.json -w "%{http_code}" \
             -X POST \
             -H "Authorization: Bearer ${CNB_TOKEN}" \
             -H "Accept: application/json" \
             -H "Content-Type: application/json" \
             "${api}/${CNB_REPO}/-/build/start" \
-            -d "{\"branch\":\"master\",\"title\":\"sync from github\"}" >/tmp/cnb-build.code
+            -d "{\"event\":\"api_trigger\",\"branch\":\"master\",\"title\":\"release ${VERSION}\"}" \
+            >/tmp/cnb-build.code
           echo "CNB 构建触发 HTTP $(cat /tmp/cnb-build.code)"
+          python3 -c 'import json; d=json.load(open("/tmp/cnb-build.json")); print("sn", d.get("sn") or ""); print("url", d.get("buildLogUrl") or "")' || cat /tmp/cnb-build.json | head -c 400
+          echo
