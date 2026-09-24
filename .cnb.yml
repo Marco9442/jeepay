@@ -1,23 +1,10 @@
-# Fork overlay：GitHub 发布新版本时触发。镜像只打 pom.xml isys.version 对应的 vX.Y.Z，不打 latest。
+# Fork overlay：镜像由 GitHub Actions 在 linux/amd64 上构建，再拷贝到 CNB。
+# 不要在 CNB 二次 docker build，默认 runner 会把清单标成 amd64、可运行层却是 arm64。
 
 $:
   api_trigger:
-    - name: 构建并发布镜像
-      services:
-        - docker
-      docker:
-        image: maven:3.9.9-eclipse-temurin-17
+    - name: 跳过镜像构建
       stages:
-        - name: 打包并推送镜像
+        - name: 说明
           script: |
-            set -eu
-            VER="v$(sed -n 's/.*<isys.version>\([^<]*\)<\/isys.version>.*/\1/p' pom.xml | head -1 | tr -d '[:space:]')"
-            echo "$VER" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
-            mvn -B -DskipTests -T 1C clean package
-            REG="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
-            for svc in jeepay-manager jeepay-merchant jeepay-payment; do
-              docker build \
-                -t "${REG}/${svc}:${VER}" \
-                "$svc"
-              docker push "${REG}/${svc}:${VER}"
-            done
+            echo "Jeepay 镜像由 GitHub mirror-release 构建并拷贝到 CNB，不在此重建。"
