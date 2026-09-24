@@ -1,6 +1,6 @@
 # 本文件属于 Fork overlay：上游同步后必须保留。
-# 职责：每小时对齐 jeequan/jeepay；按 isys.version 在 GitHub 构建 linux/amd64 镜像，
-# 推 GHCR，再拷贝到 CNB。不在 CNB 二次构建，不用华为 SWR。
+# 职责：每小时对齐 jeequan/jeepay；GitHub 把代码推到 CNB，并触发 CNB 按这份代码构建镜像。
+# 生产只拉 CNB 制品。不要把 GHCR 镜像拷到 CNB。GHCR 已有同版本时仍要触发 CNB 重建。
 name: 同步上游并发布镜像
 
 on:
@@ -147,123 +147,25 @@ jobs:
         run: |
           set -euo pipefail
           owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          python3 - "$owner" "$VERSION" "${CNB_REPO:-}" $SERVICES <<'PY'
+          python3 - "$owner" "$VERSION" $SERVICES <<'PY'
           import json, os, sys, urllib.request, urllib.error
-
-          owner, version, cnb_repo, *svcs = sys.argv[1:]
-          accept = (
-              "application/vnd.oci.image.index.v1+json, "
-              "application/vnd.docker.distribution.manifest.list.v2+json, "
-              "application/vnd.oci.image.manifest.v1+json, "
-              "application/vnd.docker.distribution.manifest.v2+json"
-          )
-
-          def cnb_token(repo):
-              req = urllib.request.Request("https://docker.cnb.cool/v2/")
+          owner, version, *svcs = sys.argv[1:]
+          missing = []
+          for svc in svcs:
+              tok_url = f"https://ghcr.io/token?service=ghcr.io&scope=repository:{owner}/{svc}:pull"
+              with urllib.request.urlopen(tok_url, timeout=20) as r:
+                  token = json.load(r).get("token") or ""
+              req = urllib.request.Request(f"https://ghcr.io/v2/{owner}/{svc}/manifests/{version}")
+              req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.index.v1+json")
               try:
                   urllib.request.urlopen(req, timeout=20)
-                  return ""
-              except urllib.error.HTTPError as e:
-                  www = e.headers.get("Www-Authenticate") or e.headers.get("WWW-Authenticate") or ""
-                  kv = {}
-                  if " " in www:
-                      for item in www.split(" ", 1)[1].split(","):
-                          if "=" in item:
-                              k, v = item.split("=", 1)
-                              kv[k.strip()] = v.strip().strip('"')
-                  realm = kv.get("realm") or "https://docker.cnb.cool/service/token"
-                  service = kv.get("service") or "cnb-registry"
-                  sep = "&" if "?" in realm else "?"
-                  url = f"{realm}{sep}service={service}&scope=repository:{repo}:pull"
-                  with urllib.request.urlopen(url, timeout=20) as r:
-                      data = json.loads(r.read())
-                  return data.get("token") or data.get("access_token") or ""
-
-          def ghcr_token(repo):
-              url = f"https://ghcr.io/token?service=ghcr.io&scope=repository:{repo}:pull"
-              with urllib.request.urlopen(url, timeout=20) as r:
-                  return json.load(r).get("token") or ""
-
-          def get_manifest(host, repo, ref, token):
-              req = urllib.request.Request(f"https://{host}/v2/{repo}/manifests/{ref}")
-              if token:
-                  req.add_header("Authorization", f"Bearer {token}")
-              req.add_header("Accept", accept)
-              try:
-                  with urllib.request.urlopen(req, timeout=30) as r:
-                      return json.loads(r.read()), r.headers.get("Docker-Content-Digest") or ""
-              except urllib.error.HTTPError as e:
-                  if e.code in (401, 404):
-                      return None, ""
-                  raise
-
-          def config_arch(host, repo, manifest, token):
-              cfg = (manifest.get("config") or {}).get("digest")
-              if not cfg:
-                  return ""
-              req = urllib.request.Request(f"https://{host}/v2/{repo}/blobs/{cfg}")
-              if token:
-                  req.add_header("Authorization", f"Bearer {token}")
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  return json.loads(r.read()).get("architecture") or ""
-
-          def real_arches(host, repo, tag, token):
-              man, digest = get_manifest(host, repo, tag, token)
-              if man is None:
-                  return None, digest
-              out = []
-              if man.get("manifests"):
-                  for m in man["manifests"]:
-                      labeled = (m.get("platform") or {}).get("architecture") or ""
-                      if labeled in ("", "unknown"):
-                          continue
-                      child, _ = get_manifest(host, repo, m["digest"], token)
-                      if not child:
-                          continue
-                      out.append((labeled, config_arch(host, repo, child, token)))
-              else:
-                  out.append(("single", config_arch(host, repo, man, token)))
-              return out, digest
-
-          def amd64_ok(pairs):
-              if not pairs:
-                  return False
-              for labeled, real in pairs:
-                  if labeled == "amd64" and real != "amd64":
-                      return False
-              return any(real == "amd64" for _, real in pairs)
-
-          ghcr_missing = []
-          for svc in svcs:
-              repo = f"{owner}/{svc}"
-              pairs, digest = real_arches("ghcr.io", repo, version, ghcr_token(repo))
-              print(svc, "ghcr", pairs, digest)
-              if not amd64_ok(pairs):
-                  ghcr_missing.append(svc)
-
-          cnb_bad = []
-          if cnb_repo:
-              for svc in svcs:
-                  repo = f"{cnb_repo}/{svc}"
-                  try:
-                      pairs, digest = real_arches("docker.cnb.cool", repo, version, cnb_token(repo))
-                  except Exception as e:
-                      print(svc, "cnb inspect error", e)
-                      cnb_bad.append(svc)
-                      continue
-                  print(svc, "cnb", pairs, digest)
-                  if not amd64_ok(pairs):
-                      cnb_bad.append(svc)
-          else:
-              cnb_bad = list(svcs)
-
-          skip = "false" if ghcr_missing else "true"
-          copy = "true" if cnb_bad else "false"
+              except urllib.error.HTTPError:
+                  missing.append(svc)
+          skip = "false" if missing else "true"
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
               f.write(f"skip={skip}\n")
-              f.write(f"copy={copy}\n")
-          print("skip", skip, "ghcr_missing", ",".join(ghcr_missing) or "-")
-          print("copy", copy, "cnb_bad", ",".join(cnb_bad) or "-")
+          print("skip", skip, "missing", ",".join(missing) or "-")
           PY
 
       - name: 准备 JDK 17
@@ -279,7 +181,7 @@ jobs:
         run: mvn -B -DskipTests -T 1C clean package
 
       - name: 登录 GHCR
-        if: steps.published.outputs.skip != 'true' || steps.published.outputs.copy == 'true'
+        if: steps.published.outputs.skip != 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -321,40 +223,8 @@ jobs:
               -f visibility=public || true
           done
 
-      - name: 登录 CNB
-        if: steps.published.outputs.copy == 'true'
-        uses: docker/login-action@v3
-        with:
-          registry: docker.cnb.cool
-          username: cnb
-          password: ${{ secrets.CNB_TOKEN }}
-
-      - name: 拷贝 GHCR 镜像到 CNB
-        if: steps.published.outputs.copy == 'true'
-        env:
-          VERSION: ${{ steps.ver.outputs.version }}
-        run: |
-          set -euo pipefail
-          if [ -z "${CNB_REPO}" ]; then
-            echo "缺少 GitHub Variable: CNB_REPO，例如 baorui.xyz/jeepay" >&2
-            exit 1
-          fi
-          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          for svc in ${SERVICES}; do
-            src="ghcr.io/${owner}/${svc}:${VERSION}"
-            dst="docker.cnb.cool/${CNB_REPO}/${svc}:${VERSION}"
-            docker pull "$src"
-            arch="$(docker image inspect --format '{{.Architecture}}' "$src")"
-            if [ "$arch" != "amd64" ]; then
-              echo "$src Architecture=${arch}，拒绝拷贝" >&2
-              exit 1
-            fi
-            docker tag "$src" "$dst"
-            docker push "$dst"
-            echo "copied ${src} -> ${dst} arch=${arch}"
-          done
-
-      - name: 同步代码到 CNB
+      - name: 推送到 CNB 并触发流水线
+        id: cnb
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
@@ -388,6 +258,7 @@ jobs:
             CNB_REPO="${group}/jeepay"
             echo "使用 CNB 仓库 ${CNB_REPO}"
           fi
+          echo "cnb_repo=${CNB_REPO}" >> "$GITHUB_OUTPUT"
 
           group="${CNB_REPO%/*}"
           name="${CNB_REPO##*/}"
@@ -406,90 +277,163 @@ jobs:
           fi
 
           git push --force "https://cnb:${CNB_TOKEN}@cnb.cool/${CNB_REPO}" "HEAD:refs/heads/master"
-          echo "已同步代码到 CNB ${CNB_REPO}，版本 ${VERSION} 镜像由 GitHub 拷贝，不触发 CNB 构建。"
+
+          # GHCR 已有同版本也不能跳过 CNB：制品必须由 CNB 按这份代码构建。
+          curl -sS -o /tmp/cnb-build.json -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${CNB_TOKEN}" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            "${api}/${CNB_REPO}/-/build/start" \
+            -d "{\"event\":\"api_trigger\",\"branch\":\"master\",\"title\":\"release ${VERSION}\"}" \
+            >/tmp/cnb-build.code
+          echo "CNB 构建触发 HTTP $(cat /tmp/cnb-build.code)"
+          case "$(cat /tmp/cnb-build.code)" in
+            200|201) ;;
+            *)
+              echo "CNB 构建触发失败" >&2
+              cat /tmp/cnb-build.json >&2 || true
+              exit 1
+              ;;
+          esac
+          python3 - <<'PY'
+          import json, os
+          d = json.load(open("/tmp/cnb-build.json"))
+          sn = d.get("sn") or ""
+          print("sn", sn)
+          print("url", d.get("buildLogUrl") or "")
+          if not d.get("success", True):
+              raise SystemExit("CNB 未接受构建触发")
+          if not sn:
+              raise SystemExit("CNB 构建未返回 sn")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"sn={sn}\n")
+          PY
+
+      - name: 等待 CNB 构建完成
+        env:
+          CNB_SN: ${{ steps.cnb.outputs.sn }}
+          CNB_REPO: ${{ steps.cnb.outputs.cnb_repo || vars.CNB_REPO }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, sys, time, urllib.error, urllib.request
+
+          api = "https://api.cnb.cool"
+          repo = os.environ["CNB_REPO"]
+          sn = os.environ["CNB_SN"]
+          token = os.environ["CNB_TOKEN"]
+          deadline = time.time() + 70 * 60
+          done = {"success", "succeeded", "complete", "completed", "finish", "finished", "ok"}
+          fail = {"failed", "fail", "error", "cancel", "cancelled", "canceled", "stopped", "timeout", "timed_out"}
+
+          def load_status():
+              req = urllib.request.Request(f"{api}/{repo}/-/build/status/{sn}")
+              req.add_header("Authorization", f"Bearer {token}")
+              req.add_header("Accept", "application/vnd.cnb.api+json, application/json")
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.load(r)
+
+          last = ""
+          while time.time() < deadline:
+              try:
+                  data = load_status()
+              except urllib.error.HTTPError as e:
+                  print("status http", e.code, flush=True)
+                  time.sleep(15)
+                  continue
+              status = (data.get("status") or "").strip()
+              pipes = data.get("pipelinesStatus") or {}
+              pipe_st = [((v or {}).get("status") or "") for v in pipes.values()] if isinstance(pipes, dict) else []
+              line = status + " " + ",".join(pipe_st)
+              if line != last:
+                  print("status", status, "pipelines", pipe_st or "-", flush=True)
+                  last = line
+              s = status.lower()
+              ps = [x.lower() for x in pipe_st]
+              if s in fail or any(x in fail for x in ps):
+                  print("CNB 构建失败", json.dumps(data)[:1500], flush=True)
+                  sys.exit(1)
+              if s in done or (ps and all(x in done for x in ps)):
+                  print("CNB 构建完成", flush=True)
+                  sys.exit(0)
+              time.sleep(30)
+          print("等待 CNB 构建超时", sn, flush=True)
+          sys.exit(1)
+          PY
 
       - name: 核验 CNB 镜像为 linux/amd64
         env:
           VERSION: ${{ steps.ver.outputs.version }}
+          CNB_REPO: ${{ steps.cnb.outputs.cnb_repo || vars.CNB_REPO }}
         run: |
           set -euo pipefail
-          if [ -z "${CNB_REPO}" ]; then
-            echo "缺少 GitHub Variable: CNB_REPO" >&2
-            exit 1
-          fi
           python3 - "$VERSION" "$CNB_REPO" $SERVICES <<'PY'
-          import json, sys, urllib.request, urllib.error
+          import base64, json, os, sys, urllib.request
 
-          version, cnb_repo, *svcs = sys.argv[1:]
-          accept = (
-              "application/vnd.oci.image.index.v1+json, "
-              "application/vnd.docker.distribution.manifest.list.v2+json, "
-              "application/vnd.oci.image.manifest.v1+json, "
-              "application/vnd.docker.distribution.manifest.v2+json"
-          )
+          version, repo, *svcs = sys.argv[1:]
+          token = os.environ["CNB_TOKEN"]
+          auth = base64.b64encode(f"cnb:{token}".encode()).decode()
 
-          def cnb_token(repo):
-              req = urllib.request.Request("https://docker.cnb.cool/v2/")
-              try:
-                  urllib.request.urlopen(req, timeout=20)
-                  return ""
-              except urllib.error.HTTPError as e:
-                  www = e.headers.get("Www-Authenticate") or e.headers.get("WWW-Authenticate") or ""
-                  kv = {}
-                  if " " in www:
-                      for item in www.split(" ", 1)[1].split(","):
-                          if "=" in item:
-                              k, v = item.split("=", 1)
-                              kv[k.strip()] = v.strip().strip('"')
-                  realm = kv.get("realm") or "https://docker.cnb.cool/service/token"
-                  service = kv.get("service") or "cnb-registry"
-                  sep = "&" if "?" in realm else "?"
-                  url = f"{realm}{sep}service={service}&scope=repository:{repo}:pull"
-                  with urllib.request.urlopen(url, timeout=20) as r:
-                      data = json.loads(r.read())
-                  return data.get("token") or data.get("access_token") or ""
-
-          def get_manifest(repo, ref, token):
-              req = urllib.request.Request(f"https://docker.cnb.cool/v2/{repo}/manifests/{ref}")
-              if token:
-                  req.add_header("Authorization", f"Bearer {token}")
+          def get(url, accept):
+              req = urllib.request.Request(url)
+              req.add_header("Authorization", f"Basic {auth}")
               req.add_header("Accept", accept)
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  return json.loads(r.read()), r.headers.get("Docker-Content-Digest") or ""
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  return json.load(r)
 
-          def config_arch(repo, manifest, token):
-              cfg = (manifest.get("config") or {}).get("digest")
-              req = urllib.request.Request(f"https://docker.cnb.cool/v2/{repo}/blobs/{cfg}")
-              if token:
-                  req.add_header("Authorization", f"Bearer {token}")
-              with urllib.request.urlopen(req, timeout=30) as r:
-                  return json.loads(r.read()).get("architecture") or ""
-
-          bad = []
-          for svc in svcs:
-              repo = f"{cnb_repo}/{svc}"
-              token = cnb_token(repo)
-              man, digest = get_manifest(repo, version, token)
-              arches = []
-              if man.get("manifests"):
-                  for m in man["manifests"]:
-                      labeled = (m.get("platform") or {}).get("architecture") or ""
-                      if labeled in ("", "unknown"):
-                          continue
-                      child, _ = get_manifest(repo, m["digest"], token)
-                      real = config_arch(repo, child, token)
-                      arches.append((labeled, real))
-              else:
-                  arches.append(("single", config_arch(repo, man, token)))
-              print(svc, digest, arches)
-              ok = any(real == "amd64" for _, real in arches) and all(
-                  real == "amd64" for labeled, real in arches if labeled == "amd64"
+          def config_arch(name, digest=None):
+              ref = digest or version
+              man = get(
+                  f"https://docker.cnb.cool/v2/{name}/manifests/{ref}",
+                  "application/vnd.docker.distribution.manifest.v2+json, "
+                  "application/vnd.oci.image.manifest.v1+json, "
+                  "application/vnd.oci.image.index.v1+json, "
+                  "application/vnd.docker.distribution.manifest.list.v2+json",
               )
-              if not ok:
-                  bad.append(f"{svc} {digest} {arches}")
-          if bad:
-              print("CNB 镜像不是可运行的 linux/amd64:", "; ".join(bad), file=sys.stderr)
-              raise SystemExit(1)
+              media = man.get("mediaType") or ""
+              if "index" in media or man.get("manifests"):
+                  amd = [
+                      m for m in man.get("manifests") or []
+                      if (m.get("platform") or {}).get("architecture") == "amd64"
+                      and (m.get("platform") or {}).get("os") == "linux"
+                  ]
+                  if not amd:
+                      raise SystemExit(f"{name}:{ref} 清单没有 linux/amd64")
+                  return config_arch(name, amd[0]["digest"])
+              cfg_digest = (man.get("config") or {}).get("digest")
+              if not cfg_digest:
+                  raise SystemExit(f"{name}:{ref} 没有 config digest")
+              cfg = get(
+                  f"https://docker.cnb.cool/v2/{name}/blobs/{cfg_digest}",
+                  "application/json, application/vnd.docker.container.image.v1+json, "
+                  "application/vnd.oci.image.config.v1+json",
+              )
+              return cfg.get("architecture") or "", cfg_digest, man.get("config", {}).get("digest")
+
+          failed = 0
+          for svc in svcs:
+              name = f"{repo}/{svc}"
+              # 再取一次清单 digest 供生产钉 pin
+              req = urllib.request.Request(f"https://docker.cnb.cool/v2/{name}/manifests/{version}")
+              req.add_header("Authorization", f"Basic {auth}")
+              req.add_header(
+                  "Accept",
+                  "application/vnd.docker.distribution.manifest.v2+json, "
+                  "application/vnd.oci.image.manifest.v1+json, "
+                  "application/vnd.oci.image.index.v1+json, "
+                  "application/vnd.docker.distribution.manifest.list.v2+json",
+              )
+              with urllib.request.urlopen(req, timeout=60) as r:
+                  digest = r.headers.get("Docker-Content-Digest") or ""
+                  man = json.load(r)
+              arch, cfg_digest, _ = config_arch(name)
+              print(svc, "digest", digest, "config", cfg_digest, "arch", arch)
+              if arch != "amd64":
+                  print(svc, "不是 amd64", file=sys.stderr)
+                  failed = 1
+          if failed:
+              raise SystemExit("CNB 镜像 architecture 不是 amd64")
           PY
 
       - name: 清理非版本标签

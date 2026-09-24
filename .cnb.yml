@@ -1,10 +1,35 @@
-# Fork overlay：镜像由 GitHub Actions 在 linux/amd64 上构建，再拷贝到 CNB。
-# 不要在 CNB 二次 docker build，默认 runner 会把清单标成 amd64、可运行层却是 arm64。
+# Fork overlay：GitHub 把代码推到 CNB，再 api_trigger。CNB 按这份代码在 amd64 节点构建。
+# 生产只拉 CNB。不要把 GHCR 镜像拷过来。Dockerfile 默认底包是华为 SWR，这里覆盖掉。
 
 $:
   api_trigger:
-    - name: 跳过镜像构建
+    - name: 构建并发布镜像
+      runner:
+        tags: cnb:arch:amd64
+      services:
+        - docker
+      docker:
+        image: maven:3.9.9-eclipse-temurin-17
       stages:
-        - name: 说明
+        - name: 打包并推送镜像
           script: |
-            echo "Jeepay 镜像由 GitHub mirror-release 构建并拷贝到 CNB，不在此重建。"
+            set -eu
+            uname -m | grep -qx x86_64
+            VER="v$(sed -n 's/.*<isys.version>\([^<]*\)<\/isys.version>.*/\1/p' pom.xml | head -1 | tr -d '[:space:]')"
+            echo "$VER" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+            mvn -B -DskipTests -T 1C clean package
+            REG="${CNB_DOCKER_REGISTRY}/${CNB_REPO_SLUG_LOWERCASE}"
+            for svc in jeepay-manager jeepay-merchant jeepay-payment; do
+              docker build \
+                --platform linux/amd64 \
+                --build-arg BASE_IMAGE=eclipse-temurin:17-jre \
+                --label "org.opencontainers.image.revision=${CNB_COMMIT}" \
+                --label "org.opencontainers.image.version=${VER}" \
+                --label "org.opencontainers.image.title=${svc}" \
+                -t "${REG}/${svc}:${VER}" \
+                "$svc"
+              arch="$(docker image inspect --format '{{.Architecture}}' "${REG}/${svc}:${VER}")"
+              echo "${svc} architecture ${arch}"
+              [ "$arch" = "amd64" ]
+              docker push "${REG}/${svc}:${VER}"
+            done
