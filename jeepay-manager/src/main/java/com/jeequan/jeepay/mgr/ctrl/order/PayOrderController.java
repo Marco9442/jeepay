@@ -71,6 +71,9 @@ public class PayOrderController extends CommonCtrl {
     /** 内网支付网关。为空时仍用运营台里的 paySiteUrl。 */
     @Value("${jeepay.pay-api-base:}")
     private String payApiBase;
+    /** 退款成功后通知适配器的内网地址。为空则不通知。 */
+    @Value("${jeepay.refund-notify-url:}")
+    private String refundNotifyUrl;
 
     /**
      * @author: pangxiaoyu
@@ -186,6 +189,10 @@ public class PayOrderController extends CommonCtrl {
         model.setRefundAmount(refundAmount);
         model.setRefundReason(refundReason);
         model.setCurrency("CNY");
+        String refundNotify = StringUtils.trimToEmpty(refundNotifyUrl);
+        if (StringUtils.isNotEmpty(refundNotify)) {
+            model.setNotifyUrl(refundNotify);
+        }
 
         MchApp mchApp = mchAppService.getById(payOrder.getAppId());
 
