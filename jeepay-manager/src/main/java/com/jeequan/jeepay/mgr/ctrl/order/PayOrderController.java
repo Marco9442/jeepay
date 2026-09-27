@@ -44,6 +44,7 @@ import io.swagger.v3.oas.annotations.enums.ParameterIn;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 
@@ -67,6 +68,9 @@ public class PayOrderController extends CommonCtrl {
     @Autowired private PayWayService payWayService;
     @Autowired private SysConfigService sysConfigService;
     @Autowired private MchAppService mchAppService;
+    /** 内网支付网关。为空时仍用运营台里的 paySiteUrl。 */
+    @Value("${jeepay.pay-api-base:}")
+    private String payApiBase;
 
     /**
      * @author: pangxiaoyu
@@ -185,7 +189,7 @@ public class PayOrderController extends CommonCtrl {
 
         MchApp mchApp = mchAppService.getById(payOrder.getAppId());
 
-        JeepayClient jeepayClient = new JeepayClient(sysConfigService.getDBApplicationConfig().getPaySiteUrl(), mchApp.getAppSecret());
+        JeepayClient jeepayClient = new JeepayClient(payGatewayBase(), mchApp.getAppSecret());
 
         try {
             RefundOrderCreateResponse response = jeepayClient.execute(request);
@@ -196,6 +200,14 @@ public class PayOrderController extends CommonCtrl {
         } catch (JeepayException e) {
             throw new BizException(e.getMessage());
         }
+    }
+
+    private String payGatewayBase() {
+        String configured = StringUtils.trimToEmpty(payApiBase);
+        String base = StringUtils.isNotEmpty(configured)
+                ? configured
+                : StringUtils.trimToEmpty(sysConfigService.getDBApplicationConfig().getPaySiteUrl());
+        return StringUtils.removeEnd(base, "/");
     }
 
 }
