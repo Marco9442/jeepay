@@ -23,6 +23,8 @@ jobs:
         run: |
           bash -n docs/install/install.sh
           bash -n docs/install/uninstall.sh
+      - name: CNB registry 认证与平台回归
+        run: python3 .github/scripts/test_verify_cnb_images.py
 
   maven-compile:
     name: Maven 编译
