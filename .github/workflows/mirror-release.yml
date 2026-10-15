@@ -1,6 +1,8 @@
 # 本文件属于 Fork overlay：上游同步后必须保留。
 # 职责：每小时对齐 jeequan/jeepay；GitHub 把代码推到 CNB，并触发 CNB 按这份代码构建镜像。
-# 生产只拉 CNB 制品。不要把 GHCR 镜像拷到 CNB。GHCR 已有同版本时仍要触发 CNB 重建。
+# 生产只拉 CNB 制品。不要把 GHCR 镜像拷到 CNB。
+# 只有镜像输入变化才重建并推送同版本标签。SQL 和文档不在镜像里；
+# 同版本标签被重新推送会改掉 digest，Clodex 的 72 小时等待会重新计算。
 name: 同步上游并发布镜像
 
 on:
@@ -223,8 +225,30 @@ jobs:
               -f visibility=public || true
           done
 
+      - name: 判断镜像输入是否变化
+        id: image
+        run: |
+          set -euo pipefail
+          rebuild=true
+          if [ "${{ github.event_name }}" = "push" ]; then
+            before="${{ github.event.before }}"
+            if [ -n "$before" ] && [ "$before" != "0000000000000000000000000000000000000000" ]; then
+              files="$(git diff --name-only "$before" HEAD)"
+              printf '%s\n' "$files"
+              rest="$(printf '%s\n' "$files" | grep -Ev '^(docs/|\.github/|README|CONTRIBUTING|upgrade\.md|version\.md|LICENSE)' || true)"
+              if [ -z "$rest" ]; then
+                rebuild=false
+              fi
+            fi
+          fi
+          echo "rebuild=$rebuild" >> "$GITHUB_OUTPUT"
+          if [ "$rebuild" = "false" ]; then
+            echo "镜像输入未变化，跳过 CNB 重建，避免同版本标签被重新推送"
+          fi
+
       - name: 推送到 CNB 并触发流水线
         id: cnb
+        if: steps.image.outputs.rebuild == 'true'
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
@@ -311,6 +335,7 @@ jobs:
           PY
 
       - name: 等待 CNB 构建完成
+        if: steps.image.outputs.rebuild == 'true'
         env:
           CNB_SN: ${{ steps.cnb.outputs.sn }}
           CNB_REPO: ${{ steps.cnb.outputs.cnb_repo || vars.CNB_REPO }}
@@ -363,6 +388,7 @@ jobs:
           PY
 
       - name: 核验 CNB 镜像为 linux/amd64
+        if: steps.image.outputs.rebuild == 'true'
         env:
           VERSION: ${{ steps.ver.outputs.version }}
           CNB_REPO: ${{ steps.cnb.outputs.cnb_repo || vars.CNB_REPO }}
@@ -371,6 +397,7 @@ jobs:
           python3 .github/scripts/verify-cnb-images.py "$VERSION" "$CNB_REPO" $SERVICES
 
       - name: 清理非版本标签
+        if: steps.image.outputs.rebuild == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
