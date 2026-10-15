@@ -308,3 +308,20 @@ ALTER TABLE `t_pay_order`
 
 ALTER TABLE `t_refund_order`
     MODIFY COLUMN `ext_param` varchar(2048) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL DEFAULT NULL COMMENT '商户扩展参数' AFTER `notify_url`;
+
+
+## -- ++++ [v3.2.2] client_ip 加宽到 45 ++++
+-- 已有库手工执行一次。IPv6 文本最长 45，与微信 payer_client_ip 一致。
+-- 启动程序不会跑这段。空库以 init.sql 为准。
+-- 不写排序规则，避免把已有列改成库默认值。
+-- 同长度档用 INPLACE，不改行。本版本拒绝 INSTANT。
+-- 若提示必须 COPY，停下来，不要整表拷贝。
+ALTER TABLE `t_pay_order`
+  MODIFY COLUMN `client_ip` VARCHAR(45) DEFAULT NULL COMMENT '客户端IP',
+  ALGORITHM=INPLACE, LOCK=NONE;
+ALTER TABLE `t_refund_order`
+  MODIFY COLUMN `client_ip` VARCHAR(45) DEFAULT NULL COMMENT '客户端IP',
+  ALGORITHM=INPLACE, LOCK=NONE;
+ALTER TABLE `t_transfer_order`
+  MODIFY COLUMN `client_ip` VARCHAR(45) DEFAULT NULL COMMENT '客户端IP',
+  ALGORITHM=INPLACE, LOCK=NONE;
